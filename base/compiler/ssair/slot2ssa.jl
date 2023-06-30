@@ -132,17 +132,8 @@ function fixemup!(@specialize(slot_filter), @specialize(rename_slot), ir::IRCode
         val = stmt.args[1]
         if isa(val, UnoptSlot)
             slot = slot_id(val)
-            if (ci.slotflags[slot] & SLOT_USEDUNDEF) == 0
-                return true
-            else
-                ssa, undef_ssa = rename_slot(val)
-                if ssa === UNDEF_TOKEN
-                    return false
-                elseif !isa(ssa, SSAValue) && !isa(ssa, NewSSAValue)
-                    return true
-                end
-                return undef_ssa
-            end
+            ssa, undef_ssa = rename_slot(val)
+            return undef_ssa
         end
         return stmt
     end
@@ -605,6 +596,7 @@ end
 
 function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                         defuses::Vector{SlotInfo}, slottypes::Vector{Any},
+                        bb_vartables::Vector{Union{Nothing,VarTable}},
                         𝕃ₒ::AbstractLattice)
     code = ir.stmts.inst
     cfg = ir.cfg
@@ -673,7 +665,8 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                     insert_node!(ir, insertpoint,
                         NewInstruction(node, Union{})).id - length(ir.stmts))
                 undef_node = undef_ssaval = nothing
-                if (ci.slotflags[idx] & SLOT_USEDUNDEF) != 0
+                bb_state = get(bb_vartables, li, nothing)
+                if bb_state === nothing || bb_state[idx].undef
                     undef_node = PhiCNode(Any[])
                     undef_ssaval = NewSSAValue(insert_node!(ir,
                         insertpoint, NewInstruction(undef_node, Bool)).id - length(ir.stmts))
@@ -693,7 +686,8 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
             ssaval = NewSSAValue(insert_node!(ir,
                 first_insert_for_bb(code, cfg, block), NewInstruction(node, Union{})).id - length(ir.stmts))
             undef_node = undef_ssaval = nothing
-            if (ci.slotflags[idx] & SLOT_USEDUNDEF) != 0
+            bb_state = get(bb_vartables, block, nothing)
+            if bb_state === nothing || bb_state[idx].undef
                 undef_node = PhiNode()
                 undef_ssaval = NewSSAValue(insert_node!(ir,
                     first_insert_for_bb(code, cfg, block), NewInstruction(undef_node, Bool)).id - length(ir.stmts))
@@ -721,9 +715,6 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
         # TODO: This isn't necessary if inlining stops replacing arguments by slots.
         for idx in cfg.blocks[item].stmts
             stmt = code[idx]
-            if isexpr(stmt, :(=))
-                stmt = stmt.args[2]
-            end
             isa(stmt, PhiNode) || continue
             for (edgeidx, edge) in pairs(stmt.edges)
                 from_bb = edge == 0 ? 0 : block_for_inst(cfg, Int(edge))
@@ -749,7 +740,7 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                 push!(node.values, incoming_val)
             end
             outgoing_def = true
-            if (ci.slotflags[slot] & SLOT_USEDUNDEF) != 0
+            if undef_ssaval !== nothing
                 push!(undef_node.edges, pred)
                 push!(undef_node.values, incoming_def)
                 outgoing_def = undef_ssaval
@@ -765,6 +756,14 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                 push!(type_refine_phi, ssaval.id)
             end
             new_typ = isa(typ, DelayedTyp) ? Union{} : tmerge(𝕃ₒ, old_entry[:type], typ)
+            bb_state = get(bb_vartables, item, nothing)
+            if bb_state !== nothing
+                vt = bb_state[slot]
+                vt_typ = widenslotwrapper(ignorelimited(vt.typ))
+                if !⊑(𝕃ₒ, new_typ, vt_typ)
+                    new_typ = vt_typ
+                end
+            end
             old_entry[:type] = new_typ
             old_entry[:inst] = node
             incoming_vals[slot] = Pair{Any, Any}(ssaval, outgoing_def)
