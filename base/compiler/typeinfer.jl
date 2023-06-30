@@ -645,9 +645,9 @@ function annotate_slot_load!(interp::AbstractInterpreter, undefs::Vector{Bool}, 
             @assert typ !== NOT_FOUND "active slot in unreached region"
         end
         # add type annotations where needed
-        if !⊑(typeinf_lattice(interp), sv.slottypes[id], typ)
-            return TypedSlot(id, typ)
-        end
+        # if !⊑(typeinf_lattice(interp), sv.slottypes[id], typ)
+        #     return TypedSlot(id, typ)
+        # end
         return x
     elseif isa(x, Expr)
         head = x.head

@@ -133,13 +133,15 @@ mutable struct OptimizationState{Interp<:AbstractInterpreter}
     inlining::InliningState{Interp}
     cfg::Union{Nothing,CFG}
     insert_coverage::Bool
+    bb_vartables::Vector{Union{Nothing,VarTable}} # nothing if not analyzed yet
 end
 function OptimizationState(sv::InferenceState, interp::AbstractInterpreter,
                            recompute_cfg::Bool=true)
     inlining = InliningState(sv, interp)
     cfg = recompute_cfg ? nothing : sv.cfg
     return OptimizationState(sv.linfo, sv.src, nothing, sv.stmt_info, sv.mod,
-                             sv.sptypes, sv.slottypes, inlining, cfg, sv.insert_coverage)
+                             sv.sptypes, sv.slottypes, inlining, cfg, sv.insert_coverage,
+                             sv.bb_vartables)
 end
 function OptimizationState(linfo::MethodInstance, src::CodeInfo, interp::AbstractInterpreter)
     # prepare src for running optimization passes if it isn't already
@@ -162,7 +164,9 @@ function OptimizationState(linfo::MethodInstance, src::CodeInfo, interp::Abstrac
     # Allow using the global MI cache, but don't track edges.
     # This method is mostly used for unit testing the optimizer
     inlining = InliningState(interp)
-    return OptimizationState(linfo, src, nothing, stmt_info, mod, sptypes, slottypes, inlining, nothing, false)
+    cfg = compute_basic_blocks(src)
+    bb_vartables = Union{Nothing,VarTable}[nothing for _ in 1:length(cfg.blocks)]
+    return OptimizationState(linfo, src, nothing, stmt_info, mod, sptypes, slottypes, inlining, nothing, false, bb_vartables)
 end
 function OptimizationState(linfo::MethodInstance, interp::AbstractInterpreter)
     world = get_world_counter(interp)
@@ -623,7 +627,7 @@ function slot2reg(ir::IRCode, ci::CodeInfo, sv::OptimizationState)
     @timeit "domtree 1" domtree = construct_domtree(ir.cfg.blocks)
     defuse_insts = scan_slot_def_use(nargs, ci, ir.stmts.inst)
     𝕃ₒ = optimizer_lattice(sv.inlining.interp)
-    @timeit "construct_ssa" ir = construct_ssa!(ci, ir, domtree, defuse_insts, sv.slottypes, 𝕃ₒ) # consumes `ir`
+    @timeit "construct_ssa" ir = construct_ssa!(ci, ir, domtree, defuse_insts, sv.slottypes, sv.bb_vartables, 𝕃ₒ) # consumes `ir`
     # NOTE now we have converted `ir` to the SSA form and eliminated slots
     # let's resize `argtypes` now and remove unnecessary types for the eliminated slots
     resize!(ir.argtypes, nargs)

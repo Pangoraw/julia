@@ -100,12 +100,7 @@ function fixup_slot!(ir::IRCode, ci::CodeInfo, idx::Int, slot::Int, stmt::UnoptS
         insert_node!(ir, idx, NewInstruction(
             Expr(:throw_undef_if_not, ci.slotnames[slot], def_ssa), Any))
     end
-    if isa(stmt, SlotNumber)
-        return ssa
-    elseif isa(stmt, TypedSlot)
-        return NewSSAValue(insert_node!(ir, idx, NewInstruction(PiNode(ssa, stmt.typ), stmt.typ)).id - length(ir.stmts))
-    end
-    @assert false # unreachable
+    return ssa
 end
 
 function fixemup!(@specialize(slot_filter), @specialize(rename_slot), ir::IRCode, ci::CodeInfo, idx::Int, @nospecialize(stmt))
@@ -605,6 +600,7 @@ end
 
 function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                         defuses::Vector{SlotInfo}, slottypes::Vector{Any},
+                        bb_vartables::Vector{Union{Nothing,VarTable}},
                         𝕃ₒ::AbstractLattice)
     code = ir.stmts.inst
     cfg = ir.cfg
@@ -721,9 +717,6 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
         # TODO: This isn't necessary if inlining stops replacing arguments by slots.
         for idx in cfg.blocks[item].stmts
             stmt = code[idx]
-            if isexpr(stmt, :(=))
-                stmt = stmt.args[2]
-            end
             isa(stmt, PhiNode) || continue
             for (edgeidx, edge) in pairs(stmt.edges)
                 from_bb = edge == 0 ? 0 : block_for_inst(cfg, Int(edge))
@@ -754,8 +747,6 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                 push!(undef_node.values, incoming_def)
                 outgoing_def = undef_ssaval
             end
-            # TODO: Remove the next line, it shouldn't be necessary
-            push!(type_refine_phi, ssaval.id)
             if isa(incoming_val, NewSSAValue)
                 push!(type_refine_phi, ssaval.id)
             end
@@ -765,6 +756,23 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                 push!(type_refine_phi, ssaval.id)
             end
             new_typ = isa(typ, DelayedTyp) ? Union{} : tmerge(𝕃ₒ, old_entry[:type], typ)
+
+            bb_state = get(bb_vartables, item, nothing)
+            if bb_state !== nothing
+                vt = bb_state[slot]
+                varstate_typ = widenslotwrapper(ignorelimited(vt.typ))
+                if !⊑(𝕃ₒ, new_typ, varstate_typ)
+                    # Core.println(varstate_typ, " ", new_typ)
+                    new_typ = varstate_typ
+                    # TODO: Remove the next line, it shouldn't be necessary
+                    push!(type_refine_phi, ssaval.id)
+                else
+                    push!(type_refine_phi, ssaval.id)
+                end
+            else
+                push!(type_refine_phi, ssaval.id)
+            end
+
             old_entry[:type] = new_typ
             old_entry[:inst] = node
             incoming_vals[slot] = Pair{Any, Any}(ssaval, outgoing_def)
@@ -800,7 +808,7 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
         push!(visited, item)
         for idx in cfg.blocks[item].stmts
             stmt = code[idx]
-            (isa(stmt, PhiNode) || (isexpr(stmt, :(=)) && isa(stmt.args[2], PhiNode))) && continue
+            isa(stmt, PhiNode) && continue
             if isa(stmt, NewvarNode)
                 incoming_vals[slot_id(stmt.slot)] = Pair{Any, Any}(UNDEF_TOKEN, false)
                 code[idx] = nothing
@@ -823,6 +831,18 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                         if val !== UNDEF_TOKEN
                             thisdef = true
                             thisval = make_ssa!(ci, code, idx, typ)
+                            #
+                            # old_entry = nothing
+                            # if isa(typ, DelayedTyp)
+                            #     old_entry = new_nodes.stmts[(val::NewSSAValue).id]
+                            #     typ = old_entry[:type]
+                            # end
+                            # @assert !isa(typ, DelayedTyp)
+                            #
+                            # if !⊑(𝕃ₒ, slottypes[slot_id(arg1)], typ)
+                            #     Main.Base.println("adding pinode ", old_entry === nothing ? "" : old_entry[:inst], " ", thisval, " ", typeof(thisval), " ", slottypes[slot_id(arg1)], " ", typ)
+                            #     thisval = NewSSAValue(insert_node!(ir, idx, NewInstruction(PiNode(thisval, typ), typ)).id - length(ir.stmts))
+                            # end
                         else
                             code[idx] = nothing
                             thisval = UNDEF_TOKEN
