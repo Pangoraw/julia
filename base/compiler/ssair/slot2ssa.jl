@@ -174,6 +174,17 @@ function rename_uses!(ir::IRCode, ci::CodeInfo, idx::Int, @nospecialize(stmt), r
     return fixemup!(stmt::UnoptSlot->true, stmt::UnoptSlot->renames[slot_id(stmt)], ir, ci, idx, stmt)
 end
 
+function requires_undef_node(bb, slot_info)
+    (; start, stop) = bb.stmts
+
+    first_use = searchsortedfirst(slot_info.uses, start)
+    first_def = searchsortedfirst(slot_info.defs, start)
+
+    first_use > stop && return true
+    first_def > stop && return true
+    return first_def >= first_use
+end
+
 function strip_trailing_junk!(ci::CodeInfo, code::Vector{Any}, info::Vector{CallInfo})
     # Remove `nothing`s at the end, we don't handle them well
     # (we expect the last instruction to be a terminator)
@@ -666,7 +677,7 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                         NewInstruction(node, Union{})).id - length(ir.stmts))
                 undef_node = undef_ssaval = nothing
                 bb_state = get(bb_vartables, li, nothing)
-                if bb_state === nothing || bb_state[idx].undef
+                if (bb_state === nothing || bb_state[idx].undef) # && requires_undef_node(cfg.blocks[li], slot)
                     undef_node = PhiCNode(Any[])
                     undef_ssaval = NewSSAValue(insert_node!(ir,
                         insertpoint, NewInstruction(undef_node, Bool)).id - length(ir.stmts))
@@ -687,7 +698,7 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
                 first_insert_for_bb(code, cfg, block), NewInstruction(node, Union{})).id - length(ir.stmts))
             undef_node = undef_ssaval = nothing
             bb_state = get(bb_vartables, block, nothing)
-            if bb_state === nothing || bb_state[idx].undef
+            if (bb_state === nothing || bb_state[idx].undef) # && requires_undef_node(cfg.blocks[block], slot)
                 undef_node = PhiNode()
                 undef_ssaval = NewSSAValue(insert_node!(ir,
                     first_insert_for_bb(code, cfg, block), NewInstruction(undef_node, Bool)).id - length(ir.stmts))
@@ -799,12 +810,36 @@ function construct_ssa!(ci::CodeInfo, ir::IRCode, domtree::DomTree,
         push!(visited, item)
         for idx in cfg.blocks[item].stmts
             stmt = code[idx]
-            (isa(stmt, PhiNode) || (isexpr(stmt, :(=)) && isa(stmt.args[2], PhiNode))) && continue
+            isa(stmt, PhiNode) && continue
             if isa(stmt, NewvarNode)
                 incoming_vals[slot_id(stmt.slot)] = Pair{Any, Any}(UNDEF_TOKEN, false)
                 code[idx] = nothing
             else
-                stmt = rename_uses!(ir, ci, idx, stmt, incoming_vals)
+                # stmt = rename_uses!(ir, ci, idx, stmt, incoming_vals)
+                function rename_load!(stmt::UnoptSlot)
+                    (incoming_val, incoming_def) = incoming_vals[slot_id(stmt)]
+                    isa(incoming_val, Argument) || return Pair{Any,Any}(incoming_val, incoming_def)
+
+                    bb_state = get(bb_vartables, item, nothing)
+                    bb_state === nothing && return Pair{Any,Any}(incoming_val, incoming_def)
+
+                    incoming_typ = typ_for_val(incoming_val, ci, ir.sptypes, idx, slottypes)
+                    incoming_typ isa DelayedTyp && return Pair{Any,Any}(incoming_val, incoming_def)
+
+                    vt = bb_state[slot_id(stmt)]
+                    vt_typ = widenslotwrapper(ignorelimited(vt.typ))
+                    if !⊑(𝕃ₒ, incoming_typ, vt_typ)
+                        incoming_vals[slot_id(stmt)] = Pair{Any,Any}(
+                            NewSSAValue(
+                                insert_node!(ir, idx, NewInstruction(PiNode(incoming_val, vt_typ), vt_typ)).id - length(ir.stmts)),
+                            incoming_def,
+                        )
+                    end
+
+                    return incoming_vals[slot_id(stmt)]
+                end
+                stmt = fixemup!(stmt::UnoptSlot->true, rename_load!, ir, ci, idx, stmt)
+
                 if stmt === nothing && isa(code[idx], Union{ReturnNode, GotoIfNot}) && idx == last(cfg.blocks[item].stmts)
                     # preserve the CFG
                     stmt = ReturnNode()
