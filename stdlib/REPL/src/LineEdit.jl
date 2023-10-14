@@ -98,6 +98,11 @@ mutable struct PromptState <: ModeState
     input_buffer::IOBuffer
     region_active::Symbol # :shift or :mark or :off
     hint::Union{String,Nothing}
+
+    selected_completion::Union{Int,Nothing}
+    completed_text::Union{String,Nothing}
+    completion_lines::Union{Int,Nothing}
+
     undo_buffers::Vector{IOBuffer}
     undo_idx::Int
     ias::InputAreaState
@@ -331,11 +336,16 @@ const MULTICOLUMN_THRESHOLD = 5
 
 # Show available completions
 function show_completions(s::PromptState, completions::Vector{String})
+    _clean_previous_completions(s)
+
     # skip any lines of input after the cursor
     cmove_down(terminal(s), input_string_newlines_aftercursor(s))
+
+    lines = 1
     println(terminal(s))
     if any(Base.Fix1(occursin, '\n'), completions)
         foreach(Base.Fix1(println, terminal(s)), completions)
+        lines += length(completions)
     else
         n = length(completions)
         colmax = 2 + maximum(length, completions; init=1) # n.b. length >= textwidth
@@ -344,22 +354,28 @@ function show_completions(s::PromptState, completions::Vector{String})
                        max(div(width(terminal(s)), colmax), 1))
 
         entries_per_col = cld(n, num_cols)
+        lines += entries_per_col
         idx = 0
         for _ in 1:entries_per_col
             for col = 0:(num_cols-1)
                 idx += 1
                 idx > n && break
                 cmove_col(terminal(s), colmax*col+1)
-                print(terminal(s), completions[idx])
+                if s.selected_completion == idx
+                    printstyled(terminal(s), completions[idx]; reverse=true)
+                else
+                    print(terminal(s), completions[idx])
+                end
             end
             println(terminal(s))
         end
     end
 
-    # make space for the prompt
-    for i = 1:input_string_newlines(s)
-        println(terminal(s))
-    end
+    lines += 1
+    cmove_up(terminal(s), lines)
+    s.completion_lines = lines
+
+    return
 end
 
 # Prompt Completions & Hints
@@ -415,6 +431,29 @@ end
 
 function complete_line(s::PromptState, repeats::Int, mod::Module)
     completions, partial, should_complete = complete_line(s.p.complete, s, mod)::Tuple{Vector{String},String,Bool}
+
+    if length(completions) >= 1 && repeats > 0
+        buf = buffer(s)
+        pos = position(s)
+        after_cursor = String(buf.data[buf.ptr:end])
+
+        # Clean up existing completion when choosing a new one
+        if !isnothing(s.completed_text) &&
+                startswith(partial * after_cursor, s.completed_text)
+            edit_splice!(s, (pos + sizeof(partial)) => (pos + sizeof(s.completed_text)))
+        end
+
+        # Move to next/previous completion
+        # TODO: this does not work for pkg completion
+        # delta = s.p.complete.modifiers.shift ? -1 : 1
+        delta = 1
+        s.selected_completion = 1 + Base.mod(something(s.selected_completion, 0) - 1 + delta, length(completions))
+        s.completed_text = completions[s.selected_completion]
+    else
+        s.selected_completion = nothing
+        s.completed_text = nothing
+    end
+
     isempty(completions) && return false
     if !should_complete
         # should_complete is false for cases where we only want to show
@@ -427,14 +466,17 @@ function complete_line(s::PromptState, repeats::Int, mod::Module)
         edit_splice!(s, (prev_pos - sizeof(partial)) => prev_pos, completions[1])
     else
         p = common_prefix(completions)
+        prev_pos = position(s)
         if !isempty(p) && p != partial
             # All possible completions share the same prefix, so we might as
             # well complete that
-            prev_pos = position(s)
             push_undo(s)
             edit_splice!(s, (prev_pos - sizeof(partial)) => prev_pos, p)
         elseif repeats > 0
             show_completions(s, completions)
+
+            edit_splice!(s, (prev_pos - sizeof(partial)) => prev_pos, s.completed_text)
+            seek(buffer(s), prev_pos)
         end
     end
     return true
@@ -486,6 +528,19 @@ function maybe_show_hint(s::PromptState)
         s.hint = "" # being "" signals to do one clear line remainder to clear the hint next time if still empty
     end
     return nothing
+end
+
+function _clean_previous_completions(s::PromptState)
+    if s.completion_lines !== nothing
+        down = input_string_newlines_aftercursor(s)
+        cmove_down(terminal(s), down)
+        for _ in 1:s.completion_lines
+            clear_line(terminal(s))
+            println(terminal(s))
+        end
+        cmove_up(terminal(s), down + s.completion_lines + 1)
+        s.completion_lines = nothing
+    end
 end
 
 function refresh_multi_line(s::PromptState; kw...)
@@ -2692,8 +2747,9 @@ end
 run_interface(::Prompt) = nothing
 
 init_state(terminal, prompt::Prompt) =
-    PromptState(terminal, prompt, IOBuffer(), :off, nothing, IOBuffer[], 1, InputAreaState(1, 1),
-                #=indent(spaces)=# -1, Threads.SpinLock(), 0.0, -Inf, nothing)
+    PromptState(terminal, prompt, IOBuffer(), :off, nothing, nothing, nothing, nothing,
+                IOBuffer[], 1, InputAreaState(1, 1), #=indent(spaces)=# -1,
+                Threads.SpinLock(), 0.0, -Inf, nothing)
 
 function init_state(terminal, m::ModalInterface)
     s = MIState(m, Main, m.modes[1], false, IdDict{Any,Any}())
